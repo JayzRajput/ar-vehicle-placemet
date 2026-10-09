@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Road Vehicle AR</title>
+<style>
+:root{--bg:#14181c;--ink:#f2efe6;--mut:#9aa3a8;--acc:#ffc61a;--pan:rgba(20,24,28,.86)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:15px/1.4 system-ui,sans-serif;overflow:hidden}
+canvas{display:block}
+#ui{position:fixed;inset:0;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+#ui>*{pointer-events:auto}
+#top{display:flex;justify-content:space-between;gap:8px;padding-top:10px}
+#msg{background:var(--pan);padding:8px 12px;border-radius:10px;max-width:70%}
+button,select{font:inherit;color:var(--ink);background:var(--pan);border:1px solid #3a444b;border-radius:10px;padding:10px 14px;min-height:44px}
+button:focus-visible,select:focus-visible{outline:2px solid var(--acc)}
+button.pri{background:var(--acc);color:#14181c;border-color:var(--acc);font-weight:700}
+#bar{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;padding:10px 0 14px}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);text-align:center;padding:24px;z-index:5}
+#start h1{margin:0;font-size:30px;letter-spacing:-.5px}
+#start p{margin:0;color:var(--mut);max-width:34ch}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Place a vehicle on the road</h1>
+  <p id="sub">Point your phone at the road surface, wait for the ring, then tap to park a full-size vehicle.</p>
+  <button class="pri" id="btnAR">Start AR</button>
+  <button id="btnPrev">Try 3D preview</button>
+  <p id="warn"></p>
+</div>
+<div id="ui" class="hide">
+  <div id="top"><div id="msg">Move phone slowly to find the road.</div><button id="btnExit">Exit</button></div>
+  <div id="bar">
+    <select id="type" aria-label="Vehicle"><option value="car">Car</option><option value="suv">SUV</option><option value="truck">Truck</option><option value="bus">Bus</option></select>
+    <select id="color" aria-label="Colour"><option value="#d62828">Red</option><option value="#1d4ed8">Blue</option><option value="#e5e7eb">White</option><option value="#16a34a">Green</option><option value="#ffc61a">Yellow</option><option value="#111827">Black</option></select>
+    <button id="rotL" aria-label="Rotate left">⟲</button><button id="rotR" aria-label="Rotate right">⟳</button>
+    <button id="guide">Lane guide: off</button>
+    <button id="undo">Undo</button><button id="clear">Clear</button>
+  </div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(()=>{
+const $=id=>document.getElementById(id);
+let renderer,scene,camera,reticle,session=null,hitSource=null,refSpace=null;
+let mode=null, placed=[], yaw=0, guideOn=false, lastHit=null, preview={};
+const ghostMat=new THREE.MeshBasicMaterial({color:0xffc61a,transparent:true,opacity:.35});
+
+/* ---------- vehicles (metres, origin at ground centre, facing -Z) ---------- */
+const specs={
+  car:{l:4.5,w:1.8,h:.75,cab:.65,cl:2.4},
+  suv:{l:4.8,w:1.95,h:1.0,cab:.75,cl:3.2},
+  truck:{l:7.5,w:2.4,h:1.3,cab:1.0,cl:2.0,box:1},
+  bus:{l:11,w:2.5,h:2.9,cab:0,cl:0,bus:1}
+};
+function box(w,h,l,m,x,y,z){const o=new THREE.Mesh(new THREE.BoxGeometry(w,h,l),m);o.position.set(x,y,z);return o}
+function makeVehicle(type,color){
+  const s=specs[type],g=new THREE.Group();
+  const body=new THREE.MeshStandardMaterial({color,roughness:.4,metalness:.3});
+  const glass=new THREE.MeshStandardMaterial({color:0x223344,roughness:.1,metalness:.6});
+  const tire=new THREE.MeshStandardMaterial({color:0x151515,roughness:.9});
+  const lift=.35;
+  if(s.bus){
+    g.add(box(s.w,s.h,s.l,body,0,lift+s.h/2,0));
+    g.add(box(s.w+.02,.9,s.l-1,glass,0,lift+1.7,0));
+  }else{
+    const bl=s.box?s.l-s.cl-.2:s.l;
+    g.add(box(s.w,s.h,s.box?s.cl:bl,body,0,lift+s.h/2,s.box?-(s.l/2-s.cl/2):0));
+    if(s.box){g.add(box(s.w,s.h*1.9,s.l-s.cl-.2,new THREE.MeshStandardMaterial({color:0xe5e7eb,roughness:.6}),0,lift+s.h*.95,s.cl/2+.1));}
+    else g.add(box(s.w-.1,s.cab,s.cl,glass,0,lift+s.h+s.cab/2,.1));
+    if(s.box)g.add(box(s.w-.1,.6,.1,glass,0,lift+s.h*.8,-(s.l/2-s.cl)+.02));
+  }
+  const wr=.38,wl=s.l/2-(s.bus?1.8:.95);
+  [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx,sz])=>{
+    const w=new THREE.Mesh(new THREE.CylinderGeometry(wr,wr,.3,20),tire);
+    w.rotation.z=Math.PI/2;w.position.set(sx*(s.w/2-.1),wr,sz*wl);g.add(w);
+    if(s.bus||s.box){const w2=w.clone();w2.position.z=sz*(wl-1.4*(sz>0?1:-1)*(sz>0?1:0));}
+  });
+  const hl=new THREE.MeshBasicMaterial({color:0xfff7c2}),tl=new THREE.MeshBasicMaterial({color:0xff2222});
+  const hy=lift+(s.bus?.6:s.h*.55);
+  g.add(box(.3,.15,.05,hl,-s.w/2+.3,hy,-s.l/2),box(.3,.15,.05,hl,s.w/2-.3,hy,-s.l/2));
+  g.add(box(.3,.15,.05,tl,-s.w/2+.3,hy,s.l/2),box(.3,.15,.05,tl,s.w/2-.3,hy,s.l/2));
+  g.traverse(o=>{if(o.isMesh)o.castShadow=true});
+  g.userData.len=s.l;
+  return g;
+}
+function laneGuide(){ // 3.5 m lane, dashed edges, drawn flat
+  const g=new THREE.Group(),L=14;
+  [-1.75,1.75].forEach(x=>{for(let z=-L/2;z<L/2;z+=2){g.add(box(.12,.01,1,ghostMat,x,.01,z+.5))}});
+  g.add(box(3.5,.005,L,new THREE.MeshBasicMaterial({color:0xffc61a,transparent:true,opacity:.08}),0,.005,0));
+  return g;
+}
+
+/* ---------- scene ---------- */
+function init(){
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,.05,200);
+  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.shadowMap.enabled=true;
+  renderer.xr.enabled=true;
+  document.body.prepend(renderer.domElement);
+  scene.add(new THREE.HemisphereLight(0xffffff,0x556070,1));
+  const sun=new THREE.DirectionalLight(0xffffff,.8);sun.position.set(4,8,3);sun.castShadow=true;
+  sun.shadow.camera.left=sun.shadow.camera.bottom=-12;sun.shadow.camera.right=sun.shadow.camera.top=12;
+  scene.add(sun);
+  reticle=new THREE.Mesh(new THREE.RingGeometry(.18,.22,32).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffc61a}));
+  reticle.matrixAutoUpdate=false;reticle.visible=false;scene.add(reticle);
+  addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+  renderer.xr.addEventListener('sessionend',()=>exit());
+  const c=renderer.xr.getController(0);c.addEventListener('select',()=>{if(mode==='ar'&&reticle.visible)placeAt(lastHit)});scene.add(c);
+  renderer.setAnimationLoop(frame);
+}
+let preGuide=null;
+function placeAt(mat){
+  const v=makeVehicle($('type').value,$('color').value);
+  const p=new THREE.Vector3(),q=new THREE.Quaternion(),s=new THREE.Vector3();
+  mat.decompose(p,q,s);
+  v.position.copy(p);
+  v.rotation.y=yaw;
+  if(guideOn){const gd=laneGuide();v.add(gd)}
+  scene.add(v);placed.push(v);
+  say(placed.length+' placed. Tap again to add more, or rotate first.');
+}
+function frame(t,f){
+  if(mode==='ar'&&f&&hitSource){
+    const r=f.getHitTestResults(hitSource);
+    if(r.length){
+      const pose=r[0].getPose(refSpace);
+      reticle.visible=true;reticle.matrix.fromArray(pose.transform.matrix);
+      lastHit=new THREE.Matrix4().fromArray(pose.transform.matrix);
+      say('Surface found. Tap to place.');
+    }else{reticle.visible=false;say('Move phone slowly to find the road.')}
+  }
+  if(mode==='preview')updatePreview();
+  renderer.render(scene,camera);
+}
+function say(t){$('msg').textContent=t}
+
+/* ---------- AR session ---------- */
+async function startAR(){
+  if(!renderer)init();
+  try{
+    session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['dom-overlay'],domOverlay:{root:$('ui')}});
+  }catch(e){$('warn').textContent='Could not start AR: '+e.message;return}
+  $('ui').addEventListener('beforexrselect',e=>e.preventDefault());
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+  refSpace=await session.requestReferenceSpace('local');
+  const vs=await session.requestReferenceSpace('viewer');
+  hitSource=await session.requestHitTestSource({space:vs});
+  mode='ar';$('start').classList.add('hide');$('ui').classList.remove('hide');
+}
+function exit(){
+  if(session){try{session.end()}catch(e){}}
+  session=null;hitSource=null;reticle&&(reticle.visible=false);
+  clearAll();
+  if(preview.root){scene.remove(preview.root);preview={}}
+  mode=null;$('ui').classList.add('hide');$('start').classList.remove('hide');
+  renderer&&(renderer.domElement.style.background='');
+}
+function clearAll(){placed.forEach(v=>scene.remove(v));placed=[]}
+
+/* ---------- desktop 3D preview (no AR needed) ---------- */
+function roadTexture(){
+  const c=document.createElement('canvas');c.width=256;c.height=512;const x=c.getContext('2d');
+  x.fillStyle='#2b2f33';x.fillRect(0,0,256,512);
+  x.fillStyle='#e8e8e8';x.fillRect(8,0,6,512);x.fillRect(242,0,6,512);
+  x.fillStyle='#ffc61a';for(let y=0;y<512;y+=128)x.fillRect(125,y+20,6,64);
+  const t=new THREE.CanvasTexture(c);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.repeat.set(1,4);return t;
+}
+function startPreview(){
+  if(!renderer)init();
+  const root=new THREE.Group();
+  const road=new THREE.Mesh(new THREE.PlaneGeometry(7,40),new THREE.MeshStandardMaterial({map:roadTexture()}));
+  road.rotation.x=-Math.PI/2;road.receiveShadow=true;root.add(road);
+  const grass=new THREE.Mesh(new THREE.PlaneGeometry(60,60),new THREE.MeshStandardMaterial({color:0x3b5d3a}));
+  grass.rotation.x=-Math.PI/2;grass.position.y=-.01;root.add(grass);
+  scene.add(root);preview={root,road,az:.6,el:.6,d:14,drag:null};
+  scene.background=new THREE.Color(0x9ec5e8);
+  const el=renderer.domElement,rc=new THREE.Raycaster();
+  el.onpointerdown=e=>{preview.drag={x:e.clientX,y:e.clientY,moved:0}};
+  el.onpointermove=e=>{const d=preview.drag;if(!d)return;const dx=e.clientX-d.x,dy=e.clientY-d.y;d.moved+=Math.abs(dx)+Math.abs(dy);d.x=e.clientX;d.y=e.clientY;preview.az-=dx*.006;preview.el=Math.min(1.4,Math.max(.15,preview.el+dy*.006))};
+  el.onpointerup=e=>{const d=preview.drag;preview.drag=null;if(d&&d.moved<6){
+    rc.setFromCamera(new THREE.Vector2(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1),camera);
+    const h=rc.intersectObject(road)[0];if(h)placeAt(new THREE.Matrix4().makeTranslation(h.point.x,h.point.y,h.point.z))}};
+  el.onwheel=e=>{preview.d=Math.min(30,Math.max(5,preview.d+e.deltaY*.01))};
+  mode='preview';$('start').classList.add('hide');$('ui').classList.remove('hide');
+  say('Preview: drag to orbit, tap the road to place.');
+}
+function updatePreview(){
+  const p=preview;camera.position.set(Math.sin(p.az)*Math.cos(p.el)*p.d,Math.sin(p.el)*p.d,Math.cos(p.az)*Math.cos(p.el)*p.d);camera.lookAt(0,0,0);
+}
+$('btnExit').onclick=()=>{scene.background=null;exit()};
+
+/* ---------- controls ---------- */
+$('rotL').onclick=()=>{yaw+=Math.PI/12;const v=placed[placed.length-1];if(v)v.rotation.y=yaw};
+$('rotR').onclick=()=>{yaw-=Math.PI/12;const v=placed[placed.length-1];if(v)v.rotation.y=yaw};
+$('undo').onclick=()=>{const v=placed.pop();v&&scene.remove(v)};
+$('clear').onclick=clearAll;
+$('guide').onclick=()=>{guideOn=!guideOn;$('guide').textContent='Lane guide: '+(guideOn?'on':'off')};
+$('btnAR').onclick=startAR;$('btnPrev').onclick=startPreview;
+(async()=>{
+  const ok=navigator.xr&&await navigator.xr.isSessionSupported('immersive-ar').catch(()=>false);
+  if(!ok){$('btnAR').disabled=true;$('warn').textContent=location.protocol==='https:'||location.hostname==='localhost'
+    ?'AR needs Android Chrome with ARCore. Use the 3D preview on this device.'
+    :'AR needs HTTPS. Deploy the site (see README) and open it on an Android phone.'}
+})();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Permissions-Policy = "xr-spatial-tracking=(self), camera=(self)"
